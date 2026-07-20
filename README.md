@@ -62,7 +62,7 @@ crate.from_cargo(
 use_repo(crate, "crates")
 ```
 
-`platform_triples` should include every exec and target triple that can participate in the build. For the common case, include the host triples you use locally and in CI plus the target triples you build for.
+`platform_triples` should include every exec and target triple that can participate in the build. For the common case, include the host triples you use locally and in CI plus the target triples you build for. At least one triple must be execution-capable (one of `SUPPORTED_EXEC_TRIPLES` in `@rules_rs//rs/platforms:triples.bzl`) so that build scripts and proc macros have a place to run; resolution fails with an actionable error otherwise.
 
 ### `.bazelrc`
 
@@ -194,6 +194,8 @@ The default Windows exec toolchain is MSVC-flavored. The upstream GNULVM toolcha
 
 The Linux exec toolchains are GNU-flavored. When targeting musl, also include the corresponding GNU triple for build scripts and proc macros.
 
+Proc-macro dependency graphs and build-dependency edges resolve against execution-capable triples (the glibc Linux, MSVC Windows, and Apple triples listed in `SUPPORTED_EXEC_TRIPLES`). A package that is also exposed as a normal library keeps its normal target-platform dependency graph. Any custom execution platform must therefore satisfy the constraints of one of the supported exec triples' platform configs: an execution platform matching none of them — for example one constrained to musl or gnullvm — selects empty execution-only feature and dependency sets.
+
 ARM soft-float (`*eabi`) and hard-float (`*eabihf`) triples — and the `aarch64-unknown-none` / `aarch64-unknown-none-softfloat` pair — share the same CPU and OS constraints, so they are disambiguated by an explicit float-ABI constraint. Bare ARM platforms default to **hard-float** (`@rules_rs//rs/platforms/constraints:hardfloat`), the conventional Linux ARM ABI (armhf) and bare-metal default. To target a soft-float triple from a custom platform, add `@rules_rs//rs/platforms/constraints:softfloat` to its `constraint_values`. The `rules_rs`-published platforms (e.g. `@rules_rs//rs/platforms:arm-unknown-linux-musleabi`) already carry the correct value.
 
 Similarly, `wasm32-wasip1` and `wasm32-wasip1-threads` are disambiguated by a WebAssembly threads constraint that defaults to threads-off (`@rules_rs//rs/platforms/constraints:wasm_threads_off`); the threaded variant opts in with `@rules_rs//rs/platforms/constraints:wasm_threads_on`.
@@ -302,7 +304,7 @@ register_toolchains(
 )
 ```
 
-If you need different PyO3 versions or Python discovery behavior, define your own `pyo3_toolchain` or `rust_pyo3_toolchain` from `@rules_rust//extensions/pyo3:defs.bzl`. 
+If you need different PyO3 versions or Python discovery behavior, define your own `pyo3_toolchain` or `rust_pyo3_toolchain` from `@rules_rust//extensions/pyo3:defs.bzl`.
 
 `rules_rs` also exposes a `@rules_rust_pyo3` compatibility repository to ease migration of existing cod:
 

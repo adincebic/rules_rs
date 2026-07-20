@@ -1,7 +1,8 @@
 load("@bazel_skylib//lib:paths.bzl", "paths")
+load("//rs/platforms:triples.bzl", "SUPPORTED_EXEC_TRIPLES")
 load("//rs/private:cargo_toml_utils.bzl", "cargo_toml_is_proc_macro")
 load("//rs/private:cfg_parser.bzl", "cfg_matches_expr_for_cfg_attrs", "triple_to_cfg_attrs")
-load("//rs/private:resolver.bzl", "resolve")
+load("//rs/private:resolver.bzl", "apply_dependency_edge", "dependency_resolution_triples", "resolve")
 load("//rs/private:select_utils.bzl", "compute_select")
 load("//rs/private:semver.bzl", "select_matching_version")
 
@@ -63,12 +64,20 @@ def cfg_match_info_for_target(target, platform_cfg_attrs, cfg_match_cache):
     cfg_match_cache[target] = match_info
     return match_info
 
-def new_feature_resolutions(package_index, possible_deps, possible_features, platform_triples):
+def exec_compatible_triples(platform_triples):
+    return set([
+        triple
+        for triple in platform_triples
+        if triple in SUPPORTED_EXEC_TRIPLES
+    ])
+
+def new_feature_resolutions(package_index, possible_deps, possible_features, platform_triples, is_proc_macro = False):
     return struct(
         features_enabled = {triple: set() for triple in platform_triples},
         build_deps = {triple: set() for triple in platform_triples},
         deps = {triple: set() for triple in platform_triples},
         aliases = {},
+        is_proc_macro = is_proc_macro,
         package_index = package_index,
         possible_deps = possible_deps,
         possible_features = possible_features,
@@ -178,6 +187,15 @@ def cargo_toml_dependencies(cargo_toml_json, workspace_cargo_toml_json = None):
                 workspace_cargo_toml_json,
                 target = target,
             ))
+        for dep, spec in value.get("build-dependencies", {}).items():
+            dependencies.append(cargo_toml_dep_to_dep_dict(
+                dep,
+                spec,
+                package_name,
+                workspace_cargo_toml_json,
+                is_build = True,
+                target = target,
+            ))
 
     return dependencies
 
@@ -188,6 +206,12 @@ def cargo_toml_fact(cargo_toml_json, workspace_cargo_toml_json = None, strip_pre
         is_proc_macro = cargo_toml_is_proc_macro(cargo_toml_json),
         strip_prefix = strip_prefix,
     )
+
+def _cargo_metadata_package_is_proc_macro(package):
+    for target in package.get("targets", []):
+        if "proc-macro" in target.get("kind", []) or "proc-macro" in target.get("crate_types", []):
+            return True
+    return False
 
 def prepare_possible_deps(dependencies, converter = None, skip_internal_rustc_placeholder_crates = True):
     possible_deps = []
@@ -393,7 +417,13 @@ def _resolve_packages(packages, package_info_by_fq_crate, platform_triples, dep_
             converter = dep_converter,
             skip_internal_rustc_placeholder_crates = skip_internal_rustc_placeholder_crates,
         )
-        feature_resolutions = new_feature_resolutions(package_index, possible_deps, package_info.get("features", {}), platform_triples)
+        feature_resolutions = new_feature_resolutions(
+            package_index,
+            possible_deps,
+            package_info.get("features", {}),
+            platform_triples,
+            is_proc_macro = package.get("is_proc_macro", False) or package_info.get("is_proc_macro", False) or _cargo_metadata_package_is_proc_macro(package_info),
+        )
         package["feature_resolutions"] = feature_resolutions
         feature_resolutions_by_fq_crate[fq] = feature_resolutions
 
@@ -503,6 +533,12 @@ def resolve_cargo_workspace_members(
         platform_cfg_attrs_by_triple[cfg_attr["_triple"]] = cfg_attr
 
     cfg_match_cache = {None: struct(matches = platform_triples, uses_feature_cfg = False)}
+    exec_triples = exec_compatible_triples(platform_triples)
+    if not exec_triples:
+        fail(
+            "platform_triples must include at least one supported execution triple for build dependencies and procedural macros. " +
+            "Add one of %s; got %s" % (SUPPORTED_EXEC_TRIPLES, platform_triples),
+        )
 
     workspace_member_keys = {}
     for package in cargo_metadata["packages"]:
@@ -537,7 +573,13 @@ def resolve_cargo_workspace_members(
             "dependencies": lockfile_pkg.get("dependencies", []),
         }
 
-        feature_resolutions = new_feature_resolutions(package_index, possible_deps, possible_features, platform_triples)
+        feature_resolutions = new_feature_resolutions(
+            package_index,
+            possible_deps,
+            possible_features,
+            platform_triples,
+            is_proc_macro = _cargo_metadata_package_is_proc_macro(package),
+        )
         resolver_package["feature_resolutions"] = feature_resolutions
         feature_resolutions_by_fq_crate[fq_crate(name, version)] = feature_resolutions
 
@@ -563,7 +605,8 @@ def resolve_cargo_workspace_members(
 
         package_feature_resolutions = feature_resolutions_by_fq_crate[fq_crate(package["name"], package["version"])]
         if "default" in package.get("features", {}):
-            for triple in platform_triples:
+            resolution_triples = exec_triples if package_feature_resolutions.is_proc_macro else platform_triples
+            for triple in resolution_triples:
                 package_feature_resolutions.features_enabled[triple].add("default")
 
         fq_deps = workspace_fq_deps.get(package["name"], {})
@@ -593,10 +636,6 @@ def resolve_cargo_workspace_members(
                             locked_version,
                         ))
 
-            features = list(dep.get("features", []))
-            if dep.get("uses_default_features"):
-                features.append("default")
-
             if not dep_fq:
                 continue
 
@@ -619,9 +658,24 @@ def resolve_cargo_workspace_members(
             match_info = cfg_match_info_for_target(target, platform_cfg_attrs, cfg_match_cache)
 
             for triple in match_info.matches:
+                # Dev dependencies are intentionally excluded from possible_deps so
+                # they do not become normal Bazel dependencies. They are still
+                # Cargo roots when building workspace tests, so their requested
+                # features and transitive dependencies must be resolved.
+                if dep.get("kind") == "dev":
+                    apply_dependency_edge(
+                        dep,
+                        feature_resolutions,
+                        triple,
+                        exec_triples,
+                        package_feature_resolutions.features_enabled[triple],
+                        platform_cfg_attrs_by_triple,
+                        features = dep.get("features", []),
+                        uses_default_features = dep.get("uses_default_features", True),
+                    )
+
                 if not is_first_party_dep or materialize_workspace_members:
                     workspace_dep_labels_by_triple[triple].add(":" + dep_name)
-                feature_resolutions.features_enabled[triple].update(features)
 
     for crate, annotation_versions in annotations.items():
         for version_key, annotation in annotation_versions.items():
@@ -633,15 +687,22 @@ def resolve_cargo_workspace_members(
             if not annotation.crate_features and not annotation.crate_features_select:
                 continue
             for version in target_versions:
-                features_enabled = feature_resolutions_by_fq_crate[fq_crate(crate, version)].features_enabled
+                feature_resolutions = feature_resolutions_by_fq_crate[fq_crate(crate, version)]
+                features_enabled = feature_resolutions.features_enabled
                 if annotation.crate_features:
-                    for triple in platform_triples:
+                    resolution_triples = exec_triples if feature_resolutions.is_proc_macro else platform_triples
+                    for triple in resolution_triples:
                         features_enabled[triple].update(annotation.crate_features)
                 for triple, features in annotation.crate_features_select.items():
-                    if triple in features_enabled:
+                    if triple not in features_enabled:
+                        continue
+                    if feature_resolutions.is_proc_macro:
+                        for exec_triple in exec_triples:
+                            features_enabled[exec_triple].update(features)
+                    else:
                         features_enabled[triple].update(features)
 
-    resolve(ctx, resolver_packages, feature_resolutions_by_fq_crate, platform_cfg_attrs_by_triple, debug)
+    resolve(ctx, resolver_packages, feature_resolutions_by_fq_crate, platform_cfg_attrs_by_triple, debug, exec_triples)
 
     for package in packages:
         feature_resolutions = package["feature_resolutions"]
@@ -680,6 +741,12 @@ def workspace_dep_data(
         workspace_package,
         use_legacy_rules_rust_platforms):
     dep_data = {}
+    exec_triples = exec_compatible_triples(platform_triples)
+    platform_cfg_attrs_by_triple = {
+        cfg_attr["_triple"]: cfg_attr
+        for cfg_attr in platform_cfg_attrs
+    }
+
     for package in cargo_metadata["packages"]:
         aliases = {}
         crate_features = {triple: set() for triple in platform_triples}
@@ -728,7 +795,6 @@ def workspace_dep_data(
 
             target = dep.get("target")
             match_info = cfg_match_info_for_target(target, platform_cfg_attrs, cfg_match_cache)
-            match = match_info.matches
 
             kind = dep["kind"]
             if kind == "dev":
@@ -738,17 +804,53 @@ def workspace_dep_data(
             else:
                 target_deps = deps
 
+            if kind == "build":
+                match = platform_triples
+                resolution_dep = dict(dep)
+                if match_info.uses_feature_cfg:
+                    resolution_dep["feature_sensitive"] = True
+                    resolution_dep["target_expr"] = target
+                    resolution_dep["target"] = set(platform_triples)
+                else:
+                    resolution_dep["target"] = set(match_info.matches)
+            elif match_info.uses_feature_cfg:
+                match = [
+                    triple
+                    for triple in platform_triples
+                    if cfg_matches_expr_for_cfg_attrs(
+                        target,
+                        [platform_cfg_attrs_by_triple[triple]],
+                        features = feature_resolutions.features_enabled[triple] if feature_resolutions else [],
+                    ).matches
+                ]
+            else:
+                match = match_info.matches
+
+            if _cargo_metadata_package_is_proc_macro(package):
+                match = [triple for triple in match if triple in exec_triples]
+
             for triple in match:
+                triple_features = feature_resolutions.features_enabled[triple] if feature_resolutions else set()
                 if dep.get("optional") and feature_resolutions:
                     dep_name = dep.get("rename") or dep["name"]
-                    triple_features = feature_resolutions.features_enabled[triple]
                     if dep_name not in triple_features and ("dep:" + dep_name) not in triple_features:
                         continue
 
                 if is_self_dep:
                     continue
 
-                target_deps[triple].add(bazel_target)
+                if kind == "build":
+                    for exec_triple in dependency_resolution_triples(
+                        resolution_dep,
+                        False,
+                        triple,
+                        exec_triples,
+                        triple_features,
+                        platform_cfg_attrs_by_triple,
+                    ):
+                        target_deps[exec_triple].add(bazel_target)
+                else:
+                    target_deps[triple].add(bazel_target)
 
         if feature_resolutions:
             for triple in platform_triples:

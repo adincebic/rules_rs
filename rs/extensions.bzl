@@ -917,7 +917,12 @@ _from_cargo = tag_class(
         ),
         "platform_triples": attr.string_list(
             mandatory = True,
-            doc = "The set of triples to resolve for. They must correspond to the union of any exec/target platforms that will participate in your build.",
+            doc = "The set of triples to resolve for. They must correspond to the union of any exec/target platforms that will participate in your build. " +
+                  "At least one triple must be execution-capable (one of `SUPPORTED_EXEC_TRIPLES` in `@rules_rs//rs/platforms:triples.bzl`), " +
+                  "because build-dependency edges and procedural-macro dependency graphs resolve against execution-capable triples; resolution fails otherwise. " +
+                  "For the same reason, any custom execution platform registered for the build must satisfy the constraints of one of those triples' " +
+                  "platform configs — an execution platform matching none of them (for example a musl-constrained one) selects empty feature and " +
+                  "dependency sets for execution-only edges.",
         ),
         "use_legacy_rules_rust_platforms": attr.bool(
             doc = "If true, use the legacy rules_rust platforms. If false, use rules_rs platforms.",

@@ -161,6 +161,7 @@ bzl_library(
         ":resolver",
         ":select_utils",
         ":semver",
+        "//rs/platforms:triples",
         "@bazel_skylib//lib:paths",
     ],
 )
