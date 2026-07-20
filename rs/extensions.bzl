@@ -8,6 +8,7 @@ load(
     "//rs/private:cargo_workspace_graph.bzl",
     "cargo_toml_fact",
     "platform_label",
+    "registry_crate_kind_candidates",
     "render_dep_data",
     "render_string_list",
     "resolve_cargo_workspace_members",
@@ -20,7 +21,7 @@ load(
     _select = "select_items",
 )
 load("//rs/private:crate_repository.bzl", "crate_repository", "local_crate_repository")
-load("//rs/private:downloader.bzl", "current_cargo_toml_fact", "download_metadata_for_git_crates", "git_cargo_toml_fact_key", "git_cargo_toml_fact_keys", "new_downloader_state", "parse_git_url", "registry_cargo_toml_fact_key", "start_crate_registry_downloads", "start_github_downloads")
+load("//rs/private:downloader.bzl", "current_cargo_toml_fact", "download_metadata_for_git_crates", "download_registry_crate_kinds", "git_cargo_toml_fact_key", "git_cargo_toml_fact_keys", "new_downloader_state", "parse_git_url", "registry_cargo_toml_fact_key", "start_crate_registry_downloads", "start_github_downloads")
 load("//rs/private:git_cargo_workspace_repository.bzl", "git_cargo_workspace_repository")
 load("//rs/private:git_crate_metadata_repository.bzl", "git_crate_metadata_repository")
 load("//rs/private:lint_flags.bzl", "cargo_toml_lint_flags")
@@ -92,6 +93,56 @@ def _additive_build_file_content(mctx, annotation):
 def _facts_with_overlay(persisted_facts, overlay):
     return struct(
         get = lambda key: overlay.get(key, persisted_facts.get(key)),
+    )
+
+def _resolve_hub_graph(
+        mctx,
+        *,
+        hub_name,
+        annotations,
+        cargo_metadata,
+        cargo_lock_path,
+        packages,
+        workspace_members,
+        facts_by_fq_crate,
+        platform_triples,
+        validate_lockfile = True,
+        debug = False,
+        use_legacy_rules_rust_platforms = False):
+    """Resolves a hub graph with the currently known crate kinds."""
+    for package in packages:
+        fact = facts_by_fq_crate[_fq_crate(package["name"], package["version"])]
+        if "strip_prefix" in fact:
+            package["strip_prefix"] = fact["strip_prefix"]
+
+        annotation = annotation_for(annotations, package["name"], package["version"], hub_name)
+        if getattr(annotation, "is_proc_macro", False):
+            package["is_proc_macro"] = True
+
+    resolved_facts = resolve_package_facts(packages, facts_by_fq_crate, platform_triples)
+    watch_manifests = cargo_lock_path.repo_name == ""
+    workspace_resolution = resolve_cargo_workspace_members(
+        mctx,
+        cargo_metadata = cargo_metadata,
+        packages = packages,
+        workspace_members = workspace_members,
+        versions_by_name = resolved_facts.versions_by_name,
+        feature_resolutions_by_fq_crate = resolved_facts.feature_resolutions_by_fq_crate,
+        annotations = annotations,
+        platform_triples = platform_triples,
+        materialize_workspace_members = False,
+        validate_lockfile = validate_lockfile,
+        debug = debug,
+        dep_label_prefix = "@%s//:" % hub_name,
+        watch_manifests = watch_manifests,
+        use_legacy_rules_rust_platforms = use_legacy_rules_rust_platforms,
+    )
+    return struct(
+        cargo_metadata = cargo_metadata,
+        feature_resolutions_by_fq_crate = resolved_facts.feature_resolutions_by_fq_crate,
+        packages = packages,
+        versions_by_name = resolved_facts.versions_by_name,
+        workspace_resolution = workspace_resolution,
     )
 
 def _generate_hub_and_spokes(
@@ -287,29 +338,63 @@ def _generate_hub_and_spokes(
 
         facts_by_fq_crate[_fq_crate(name, version)] = fact
 
-    resolved_facts = resolve_package_facts(packages, facts_by_fq_crate, platform_triples)
-    feature_resolutions_by_fq_crate = resolved_facts.feature_resolutions_by_fq_crate
-    versions_by_name = resolved_facts.versions_by_name
+    graph = None
+    for classification_round in range(len(packages) + 1):
+        graph = _resolve_hub_graph(
+            mctx,
+            hub_name = hub_name,
+            annotations = annotations,
+            cargo_metadata = cargo_metadata,
+            cargo_lock_path = cargo_lock_path,
+            packages = packages,
+            workspace_members = workspace_members,
+            facts_by_fq_crate = facts_by_fq_crate,
+            platform_triples = platform_triples,
+            validate_lockfile = validate_lockfile,
+            debug = debug,
+            use_legacy_rules_rust_platforms = use_legacy_rules_rust_platforms,
+        )
 
-    # Only files in the current Bazel workspace can/should be watched, so check where our manifests are located.
-    watch_manifests = cargo_lock_path.repo_name == ""
+        candidates = registry_crate_kind_candidates(
+            graph.packages,
+            facts_by_fq_crate,
+            platform_triples,
+        )
+        if not candidates:
+            break
 
-    workspace_resolution = resolve_cargo_workspace_members(
-        mctx,
-        cargo_metadata = cargo_metadata,
-        packages = packages,
-        workspace_members = workspace_members,
-        versions_by_name = versions_by_name,
-        feature_resolutions_by_fq_crate = feature_resolutions_by_fq_crate,
-        annotations = annotations,
-        platform_triples = platform_triples,
-        materialize_workspace_members = False,
-        validate_lockfile = validate_lockfile,
-        debug = debug,
-        dep_label_prefix = "@%s//:" % hub_name,
-        watch_manifests = watch_manifests,
-        use_legacy_rules_rust_platforms = use_legacy_rules_rust_platforms,
-    )
+        found_proc_macro = False
+        download_namespace = "%s_%s" % (hub_name, classification_round)
+        for result in download_registry_crate_kinds(mctx, downloader_state, download_namespace, candidates, cargo_credentials):
+            package = result.package
+            fq = _fq_crate(package["name"], package["version"])
+            fact = facts_by_fq_crate[fq]
+            fact["is_proc_macro"] = result.is_proc_macro
+            key = registry_cargo_toml_fact_key(package["source"], package["name"], package["version"])
+            facts[key] = json.encode(fact)
+            if result.is_proc_macro:
+                found_proc_macro = True
+
+        if not found_proc_macro:
+            break
+
+        # Resolution mutates package metadata. Only pay for a fresh copy when a
+        # discovered proc macro requires another resolution round.
+        cargo_metadata = json.decode(json.encode(graph.cargo_metadata))
+        split_packages = split_lockfile_packages(
+            hub_name,
+            cargo_metadata,
+            workspace_cargo_toml_json,
+            all_packages,
+        )
+        packages = split_packages.packages
+        workspace_members = split_packages.workspace_members
+
+    cargo_metadata = graph.cargo_metadata
+    packages = graph.packages
+    feature_resolutions_by_fq_crate = graph.feature_resolutions_by_fq_crate
+    versions_by_name = graph.versions_by_name
+    workspace_resolution = graph.workspace_resolution
     cfg_match_cache = workspace_resolution.cfg_match_cache
     platform_cfg_attrs = workspace_resolution.platform_cfg_attrs
     workspace_dep_labels_by_triple = workspace_resolution.workspace_dep_labels_by_triple
@@ -1018,6 +1103,9 @@ _annotation = tag_class(
         ),
         "crate_features_select": attr.string_list_dict(
             doc = "A list of strings to add to a crate's `rust_library::crate_features` attribute. Keys should be the platform triplet. Value should be a list of features.",
+        ),
+        "is_proc_macro": attr.bool(
+            doc = "Resolve this proc-macro crate and its dependencies for execution-capable triples.",
         ),
         "data": attr.label_list(
             doc = "A list of labels to add to a crate's `rust_library::data` attribute.",

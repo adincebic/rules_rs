@@ -440,6 +440,39 @@ def resolve_package_facts(packages, facts_by_fq_crate, platform_triples, skip_in
         skip_internal_rustc_placeholder_crates = skip_internal_rustc_placeholder_crates,
     )
 
+def registry_crate_kind_candidates(packages, facts_by_fq_crate, platform_triples):
+    """Returns registry crates whose unknown kind can affect resolution.
+
+    Args:
+        packages: Resolved lockfile packages.
+        facts_by_fq_crate: Manifest-derived facts keyed by fully qualified crate.
+        platform_triples: Target and execution triples participating in resolution.
+
+    Returns:
+        Registry packages whose proc-macro status has not yet been established
+        and could change feature or dependency resolution.
+    """
+    if len(platform_triples) < 2:
+        return []
+
+    candidates = []
+    for package in packages:
+        if not package.get("source", "").startswith("sparse+"):
+            continue
+
+        fq = fq_crate(package["name"], package["version"])
+        fact = facts_by_fq_crate[fq]
+        feature_resolutions = package["feature_resolutions"]
+        if "is_proc_macro" in fact or feature_resolutions.is_proc_macro:
+            continue
+
+        features_enabled = feature_resolutions.features_enabled
+        baseline = features_enabled[platform_triples[0]]
+        if any([features_enabled[triple] != baseline for triple in platform_triples[1:]]):
+            candidates.append(package)
+
+    return candidates
+
 def resolve_cargo_metadata_packages(packages, cargo_metadata, platform_triples, skip_internal_rustc_placeholder_crates = True):
     metadata_by_fq_crate = {
         fq_crate(package["name"], package["version"]): package

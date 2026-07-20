@@ -1,7 +1,9 @@
+load("@bazel_tools//tools/build_defs/repo:cache.bzl", "get_default_canonical_id")
 load("@bazel_tools//tools/build_defs/repo:git_worker.bzl", "git_repo")
 load(":annotations.bzl", "annotation_for")
 load(":cargo_credentials.bzl", "registry_auth_headers")
-load(":registry_utils.bzl", "CRATES_IO_REGISTRY", "sharded_path")
+load(":cargo_toml_utils.bzl", "cargo_toml_is_proc_macro")
+load(":registry_utils.bzl", "CRATES_IO_REGISTRY", "registry_download_url", "sharded_path")
 load(":toml2json.bzl", "run_toml2json")
 
 def parse_git_url(url):
@@ -83,8 +85,121 @@ def new_downloader_state():
         in_flight_git_crate_fetches_by_url = {},
         in_flight_git_member_fetches_by_url = {},
         in_flight_registry_fetches_by_source_and_crate = {},
+        in_flight_registry_config_fetches_by_source = {},
         pending_git_clones_by_source = {},
+        registry_configs_by_source = {},
     )
+
+def download_registry_crate_kinds(mctx, state, namespace, packages, cargo_credentials):
+    """Reads checksummed registry manifests and returns proc-macro facts.
+
+    This is intentionally used only for crates whose resolved features vary by
+    platform. Crate kind cannot affect resolution when every platform already
+    has the same features, so avoiding those downloads preserves lazy fetching
+    for the common case. Results are persisted as module-extension facts.
+
+    Args:
+        mctx: Module extension context.
+        state: Shared downloader state for cross-round request deduplication.
+        namespace: Unique prefix for temporary files in this extension evaluation.
+        packages: Registry packages to inspect.
+        cargo_credentials: Mapping of registry URLs to authentication tokens.
+
+    Returns:
+        A list of structs pairing each package with its is_proc_macro value.
+    """
+    sources = []
+    seen_sources = set()
+    for package in packages:
+        source = package["source"]
+        if source in seen_sources:
+            continue
+        seen_sources.add(source)
+        sources.append(source)
+
+        if source in state.registry_configs_by_source or source in state.in_flight_registry_config_fetches_by_source:
+            continue
+
+        config_path = "%s_registry_config_%s.json" % (
+            _sanitize_path_fragment(namespace),
+            len(state.in_flight_registry_config_fetches_by_source),
+        )
+        state.in_flight_registry_config_fetches_by_source[source] = struct(
+            path = config_path,
+            token = mctx.download(
+                source.removeprefix("sparse+") + "config.json",
+                config_path,
+                block = False,
+                headers = registry_auth_headers(cargo_credentials, source),
+            ),
+        )
+
+    # Registry configs are small, but fetching all of them in parallel avoids a
+    # serialized network round trip before archive downloads can be enqueued.
+    for source in sources:
+        if source in state.registry_configs_by_source:
+            continue
+        fetch = state.in_flight_registry_config_fetches_by_source[source]
+        fetch.token.wait()
+        state.registry_configs_by_source[source] = json.decode(mctx.read(fetch.path))
+
+    downloads = []
+
+    for index in range(len(packages)):
+        package = packages[index]
+        source = package["source"]
+        headers = registry_auth_headers(cargo_credentials, source)
+        config = state.registry_configs_by_source[source]
+
+        name = package["name"]
+        version = package["version"]
+        checksum = package["checksum"]
+        url = registry_download_url(config, name, version, checksum)
+        output_prefix = "%s_registry_crate_kind_%s" % (
+            _sanitize_path_fragment(namespace),
+            index,
+        )
+
+        # Bazel 8 infers the archive type from the filename; mctx.extract's
+        # explicit `type` parameter is only available in Bazel 9 and later.
+        archive = output_prefix + ".tar.gz"
+        downloads.append(struct(
+            archive = archive,
+            extract_dir = output_prefix,
+            name = name,
+            package = package,
+            token = mctx.download(
+                url,
+                archive,
+                block = False,
+                canonical_id = get_default_canonical_id(mctx, urls = [url]),
+                headers = headers,
+                sha256 = checksum,
+            ),
+            version = version,
+        ))
+
+    results = []
+    for download in downloads:
+        download.token.wait()
+        mctx.extract(
+            download.archive,
+            output = download.extract_dir,
+            # Bazel 7.7 only supports the legacy spelling; newer Bazel versions
+            # retain it as a compatibility alias.
+            stripPrefix = "%s-%s" % (download.name, download.version),
+        )
+        cargo_toml = run_toml2json(mctx, download.extract_dir + "/Cargo.toml")
+        manifest_package = cargo_toml.get("package", {})
+        if manifest_package.get("name") != download.name or manifest_package.get("version") != download.version:
+            fail("Registry archive for %s %s contained a mismatched Cargo.toml" % (download.name, download.version))
+
+        results.append(struct(
+            is_proc_macro = cargo_toml_is_proc_macro(cargo_toml),
+            package = download.package,
+        ))
+
+    return results
 
 def start_github_downloads(
         mctx,

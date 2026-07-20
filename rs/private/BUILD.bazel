@@ -136,8 +136,10 @@ bzl_library(
     deps = [
         ":annotations",
         ":cargo_credentials",
+        ":cargo_toml_utils",
         ":registry_utils",
         ":toml2json",
+        "@bazel_tools//tools/build_defs/repo:cache.bzl",
         "@bazel_tools//tools/build_defs/repo:git_worker.bzl",
     ],
 )

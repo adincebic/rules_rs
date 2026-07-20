@@ -1,5 +1,5 @@
 load("@bazel_skylib//lib:unittest.bzl", "asserts", "unittest")
-load(":cargo_workspace_graph.bzl", "cargo_toml_dependencies", "cargo_toml_fact", "compute_package_fq_deps", "exec_compatible_triples", "new_feature_resolutions", "resolve_cargo_workspace_members", "resolve_package_facts", "select_package_fq_dep", "split_lockfile_packages", "workspace_dep_data")
+load(":cargo_workspace_graph.bzl", "cargo_toml_dependencies", "cargo_toml_fact", "compute_package_fq_deps", "exec_compatible_triples", "new_feature_resolutions", "registry_crate_kind_candidates", "resolve_cargo_workspace_members", "resolve_package_facts", "select_package_fq_dep", "split_lockfile_packages", "workspace_dep_data")
 load(":cfg_parser.bzl", "triple_to_cfg_attrs")
 load(":resolver.bzl", "resolve")
 
@@ -626,6 +626,103 @@ def _resolve_confines_proc_macro_dependency_graph_to_exec_impl(ctx):
 
 resolve_confines_proc_macro_dependency_graph_to_exec_test = unittest.make(_resolve_confines_proc_macro_dependency_graph_to_exec_impl)
 
+def _resolve_registry_proc_macro_features_for_exec_triples_impl(ctx):
+    env = unittest.begin(ctx)
+
+    linux = "x86_64-unknown-linux-gnu"
+    windows = "x86_64-pc-windows-gnullvm"
+    triples = [linux, windows]
+    facts = {
+        "consumer-1.0.0": {
+            "dependencies": [
+                {
+                    "default_features": False,
+                    "features": ["target-api"],
+                    "name": "derive-helper",
+                    "target": "cfg(windows)",
+                },
+            ],
+            "features": {},
+        },
+        "derive-helper-1.0.0": {
+            "dependencies": [],
+            "features": {"target-api": []},
+        },
+    }
+    packages = [
+        {
+            "dependencies": [],
+            "name": "derive-helper",
+            "source": "sparse+https://index.crates.io/",
+            "version": "1.0.0",
+        },
+        {
+            "dependencies": ["derive-helper 1.0.0"],
+            "name": "consumer",
+            "source": "sparse+https://index.crates.io/",
+            "version": "1.0.0",
+        },
+    ]
+    package_resolution = resolve_package_facts(packages, facts, triples)
+    resolve_cargo_workspace_members(
+        None,
+        cargo_metadata = {"packages": []},
+        packages = packages,
+        workspace_members = [],
+        versions_by_name = package_resolution.versions_by_name,
+        feature_resolutions_by_fq_crate = package_resolution.feature_resolutions_by_fq_crate,
+        annotations = {},
+        platform_triples = triples,
+        materialize_workspace_members = False,
+        validate_lockfile = False,
+    )
+
+    derive_helper = package_resolution.feature_resolutions_by_fq_crate["derive-helper-1.0.0"]
+    asserts.equals(env, [], sorted(derive_helper.features_enabled[linux]))
+    asserts.equals(env, ["target-api"], sorted(derive_helper.features_enabled[windows]))
+    asserts.equals(
+        env,
+        ["derive-helper"],
+        [package["name"] for package in registry_crate_kind_candidates(packages, facts, triples)],
+    )
+
+    facts["derive-helper-1.0.0"]["is_proc_macro"] = True
+    packages = [
+        {
+            "dependencies": [],
+            "name": "derive-helper",
+            "source": "sparse+https://index.crates.io/",
+            "version": "1.0.0",
+        },
+        {
+            "dependencies": ["derive-helper 1.0.0"],
+            "name": "consumer",
+            "source": "sparse+https://index.crates.io/",
+            "version": "1.0.0",
+        },
+    ]
+    package_resolution = resolve_package_facts(packages, facts, triples)
+    resolve_cargo_workspace_members(
+        None,
+        cargo_metadata = {"packages": []},
+        packages = packages,
+        workspace_members = [],
+        versions_by_name = package_resolution.versions_by_name,
+        feature_resolutions_by_fq_crate = package_resolution.feature_resolutions_by_fq_crate,
+        annotations = {},
+        platform_triples = triples,
+        materialize_workspace_members = False,
+        validate_lockfile = False,
+    )
+
+    derive_helper = package_resolution.feature_resolutions_by_fq_crate["derive-helper-1.0.0"]
+    asserts.equals(env, ["target-api"], sorted(derive_helper.features_enabled[linux]))
+    asserts.equals(env, [], sorted(derive_helper.features_enabled[windows]))
+    asserts.equals(env, [], registry_crate_kind_candidates(packages, facts, triples))
+    return unittest.end(env)
+
+resolve_registry_proc_macro_features_for_exec_triples_test = unittest.make(_resolve_registry_proc_macro_features_for_exec_triples_impl)
+
 def _resolve_keeps_public_aliases_buildable_outside_cargo_target_impl(ctx):
     env = unittest.begin(ctx)
 
@@ -855,6 +952,7 @@ def cargo_workspace_graph_tests():
         resolve_package_facts_attaches_feature_resolutions_test,
         resolve_package_facts_preserves_persisted_dependency_features_test,
         resolve_preserves_build_dependency_host_filters_test,
+        resolve_registry_proc_macro_features_for_exec_triples_test,
         select_package_fq_dep_uses_package_name_test,
         select_package_fq_dep_uses_req_for_duplicate_versions_test,
         split_lockfile_packages_finds_local_package_paths_test,
